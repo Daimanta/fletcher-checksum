@@ -116,10 +116,12 @@ const Fletcher32 = struct {
 const Fletcher64 = struct {
     c0: u64,
     c1: u64,
+    cache: [3]u8,
+    cache_size: usize,
     const Self = @This();
 
     pub fn init() Self {
-        return Self{ .c0 = 0, .c1 = 0 };
+        return Self{ .c0 = 0, .c1 = 0, .cache = [3]u8{0, 0, 0}, .cache_size = 0 };
     }
 
     pub fn reset(self: *Self) void {
@@ -127,14 +129,62 @@ const Fletcher64 = struct {
         self.c1 = 0;
     }
 
-    pub fn update(self: *Self, input: []u32) void {
-        for (input) |dword| {
-            self.c0 = (self.c0 +% dword) % MAX_INT;
-            self.c1 = (self.c1 +% self.c0) % MAX_INT;
+    pub fn update(self: *Self, input: []const u8) void {
+        if (self.cache_size > 0) {
+            if (self.cache_size + input.len <= 3) {
+                // Just append to the cache
+                mem.copy(u8, self.cache[self.cache_size..], input[0..]);
+                self.cache_size += input.len;
+            } else {
+                // Flush the cache, process u32's, rebuild cache
+                const start = 4 - self.cache_size;
+                var word_bytes: [4]u8 = [4]u8{0, 0, 0, 0};
+                mem.copy(u8, word_bytes[0..], self.cache[0..self.cache_size]);
+                mem.copy(u8, word_bytes[self.cache_size..4], input[0..start]);
+                self.update_internal_unit(fourBytesToU32(word_bytes));
+                const take = ((input.len - start)/4)*4;
+                const end = start + take;
+                var slice = input[start..end];
+                const cast_array = mem.bytesAsSlice(u32, slice);
+                for (cast_array) |dword| {
+                    self.update_internal_unit(dword);
+                }
+                if (end != input.len) {
+                    self.cache_size = input.len - end;
+                    mem.copy(u8, self.cache[0..], input[end..]);
+                } else {
+                    self.cache_size = 0;
+                }
+            }
+        } else {
+            const take = (input.len/4)*4;
+            var slice = input[0..take];
+            const cast_array = mem.bytesAsSlice(u32, slice);
+            for (cast_array) |dword| {
+                self.update_internal_unit(dword);
+            }
+            if (take != input.len) {
+                self.cache_size = input.len - take;
+                mem.copy(u8, self.cache[0..], input[take..]);
+            }
         }
+    }
+    
+    fn update_internal_unit(self: *Self, unit: u32) void {
+        self.c0 = (self.c0 +% unit) % MAX_INT;
+        self.c1 = (self.c1 +% self.c0) % MAX_INT;
+    }
+    
+    fn fourBytesToU32(bytes: [4]u8) u32 {
+        return mem.bytesAsSlice(u32, bytes[0..])[0];
     }
 
     pub fn final(self: *Self) u64 {
+        if (self.cache_size > 0) {
+            var word_bytes: [4]u8 = [4]u8{0, 0, 0, 0};
+            mem.copy(u8, word_bytes[0..], self.cache[0..self.cache_size]);
+            self.update_internal_unit(fourBytesToU32(word_bytes));
+        }
         return self.c1 << 32 | self.c0;
     }
 };
@@ -291,3 +341,99 @@ test "fletcher 32 piecewise 4" {
     try testing.expectEqual(expected, result);
 }
 
+test "fletcher 64 empty string" {
+    var empty_block: []u8 = &.{};
+    var fletcher64 = Fletcher64.init();
+    fletcher64.update(empty_block);
+    const result = fletcher64.final();
+
+    const expected: u64 = 0;
+    try testing.expectEqual(expected, result);
+}
+
+test "fletcher 64 string1" {
+    const mystring_const: []const u8 = "abcde";
+
+    var fletcher = Fletcher64.init();
+    fletcher.update(mystring_const[0..]);
+    const result = fletcher.final();
+
+    const expected: u64 = 14467467625952928454;
+    try testing.expectEqual(expected, result);
+}
+
+test "fletcher 64 string2" {
+    const mystring_const: []const u8 = "abcdef";
+
+    var fletcher = Fletcher64.init();
+    fletcher.update(mystring_const[0..]);
+    const result = fletcher.final();
+
+    const expected: u64 = 14467579776138987718;
+    try testing.expectEqual(expected, result);
+}
+
+test "fletcher 64 string3" {
+    const mystring_const: []const u8 = "abcdefgh";
+
+    var fletcher = Fletcher64.init();
+    fletcher.update(mystring_const[0..]);
+    const result = fletcher.final();
+
+    const expected: u64 = 3543817411021686982;
+    try testing.expectEqual(expected, result);
+}
+
+test "fletcher 64 piecewise 1" {
+    const mystring_const1: []const u8 = "abc";
+    const mystring_const2: []const u8 = "defgh";
+
+    var fletcher = Fletcher64.init();
+    fletcher.update(mystring_const1[0..]);
+    fletcher.update(mystring_const2[0..]);
+    const result = fletcher.final();
+
+    const expected: u64 = 3543817411021686982;
+    try testing.expectEqual(expected, result);
+}
+
+test "fletcher 64 piecewise 2" {
+    const mystring_const1: []const u8 = "abcd";
+    const mystring_const2: []const u8 = "efgh";
+
+    var fletcher = Fletcher64.init();
+    fletcher.update(mystring_const1[0..]);
+    fletcher.update(mystring_const2[0..]);
+    const result = fletcher.final();
+
+    const expected: u64 = 3543817411021686982;
+    try testing.expectEqual(expected, result);
+}
+
+test "fletcher 64 piecewise 3" {
+    const mystring_const1: []const u8 = "abcdefg";
+    const mystring_const2: []const u8 = "h";
+
+    var fletcher = Fletcher64.init();
+    fletcher.update(mystring_const1[0..]);
+    try testing.expectEqual(@as(usize, 3), fletcher.cache_size);
+    try testing.expectEqual([_]u8{'e', 'f', 'g'}, fletcher.cache);
+    fletcher.update(mystring_const2[0..]);
+    const result = fletcher.final();
+
+    const expected: u64 = 3543817411021686982;
+    try testing.expectEqual(expected, result);
+}
+
+test "fletcher 64 piecewise 4" {
+    const mystring_const1: []const u8 = "abcd";
+    const mystring_const2: []const u8 = "e";
+
+    var fletcher = Fletcher64.init();
+    fletcher.update(mystring_const1[0..]);
+    fletcher.update(mystring_const2[0..]);
+    const result = fletcher.final();
+
+    const expected: u64 = 14467467625952928454;
+    try testing.expectEqual(expected, result);
+}
